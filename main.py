@@ -71,7 +71,40 @@ def part1_clean(raw):
     A row that breaks both rules counts in both bad_time and bad_fare, but once in removed.
     """
     # TODO
-    return None, None
+    from pyspark.sql.functions import expr, when, unix_timestamp
+
+    df = raw.withColumn("fare_double", expr("try_cast(fare AS DOUBLE)"))
+
+    bad_time = (
+        col("pickup_ts").isNull() |
+        col("dropoff_ts").isNull() |
+        (col("dropoff_ts") <= col("pickup_ts"))
+    )
+
+    bad_fare = col("fare_double").isNull()
+
+    counts = df.agg(
+        count("*").alias("rows_total"),
+        ssum(when(bad_time, 1).otherwise(0)).alias("bad_time"),
+        ssum(when(bad_fare, 1).otherwise(0)).alias("bad_fare"),
+        ssum(when(bad_time | bad_fare, 1).otherwise(0)).alias("removed"),
+        ssum(when(~bad_time & ~bad_fare, 1).otherwise(0)).alias("rows_kept")
+    )
+
+    clean = (
+        df.filter(~bad_time & ~bad_fare)
+        .drop("fare")
+        .withColumnRenamed("fare_double", "fare")
+        .withColumn("day", to_date(col("pickup_ts")))
+        .withColumn(
+            "duration_min",
+            (unix_timestamp("dropoff_ts") - unix_timestamp("pickup_ts")) / 60.0
+        )
+    )
+
+    clean.write.mode("overwrite").parquet(f"{out_dir}/clean_trips")
+
+    return clean, counts
 
 
 # ---------------------------------------------------------------- Part 2a: zone revenue per day
@@ -82,7 +115,16 @@ def part2a_zone_revenue(clean, zones):
     One row per (day, zone) with at least one trip. Ordered by day, then zone_id.
     """
     # TODO
-    return None
+    return (
+        clean.join(zones, clean.pickup_zone == zones.zone_id, "inner")
+        .groupBy("day", "zone_id", "zone_name")
+        .agg(
+            count("*").alias("trips"),
+            sround(ssum("fare"), 2).alias("revenue")
+        )
+        .select("day", "zone_id", "zone_name", "trips", "revenue")
+        .orderBy("day", "zone_id")
+    )
 
 
 # ---------------------------------------------------------------- Part 2b: driver busiest day
@@ -94,7 +136,22 @@ def part2b_driver_busiest_day(clean):
     partitioned by driver and ordered by trips descending, day ascending.
     """
     # TODO
-    return None
+    daily = (
+        clean.groupBy("driver_id", "day")
+        .agg(count("*").alias("trips"))
+    )
+
+    window = (
+        Window.partitionBy("driver_id")
+        .orderBy(desc("trips"), col("day").asc())
+    )
+
+    return (
+        daily.withColumn("rank", row_number().over(window))
+        .filter(col("rank") == 1)
+        .select("driver_id", "day", "trips")
+        .orderBy("driver_id")
+    )
 
 
 # ---------------------------------------------------------------- Part 3: Spark SQL
@@ -108,7 +165,21 @@ def part3_borough_sql(clean, zones):
     your report.
     """
     # TODO
-    return None
+    clean.createOrReplaceTempView("trips")
+    zones.createOrReplaceTempView("zones")
+
+    return spark.sql("""
+        SELECT
+            z.borough,
+            COUNT(*) AS trips,
+            ROUND(SUM(t.fare), 2) AS revenue,
+            ROUND(AVG(t.distance_km), 2) AS avg_distance_km
+        FROM trips t
+        JOIN zones z
+            ON t.pickup_zone = z.zone_id
+        GROUP BY z.borough
+        ORDER BY revenue DESC
+    """)
 
 
 clean, counts = part1_clean(raw)
